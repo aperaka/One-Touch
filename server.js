@@ -2,13 +2,18 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 const { URL } = require('url');
 
 const PORT = process.env.PORT || 3000;
 const root = __dirname;
 const dataDir = path.join(root, 'data');
 const usersFile = path.join(dataDir, 'users.json');
-const sessions = new Map();
+const localSessions = new Map();
+const pool = process.env.DATABASE_URL ? new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined
+}) : null;
 
 const feeds = {
   Soccer: [
@@ -51,36 +56,25 @@ function send(res, code, body, type='application/json; charset=utf-8', extraHead
   res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store', ...extraHeaders });
   res.end(body);
 }
-
-function json(res, code, value, headers={}) {
-  send(res, code, JSON.stringify(value), 'application/json; charset=utf-8', headers);
-}
-
+function json(res, code, value, headers={}) { send(res, code, JSON.stringify(value), 'application/json; charset=utf-8', headers); }
 function ensureDataDir() {
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
   if (!fs.existsSync(usersFile)) fs.writeFileSync(usersFile, '[]', 'utf8');
 }
-
 function readUsers() {
   ensureDataDir();
-  try { return JSON.parse(fs.readFileSync(usersFile, 'utf8')); }
-  catch { return []; }
+  try { return JSON.parse(fs.readFileSync(usersFile, 'utf8')); } catch { return []; }
 }
-
 function writeUsers(users) {
   ensureDataDir();
   fs.writeFileSync(usersFile, JSON.stringify(users, null, 2), 'utf8');
 }
-
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
     req.on('data', chunk => {
       body += chunk;
-      if (body.length > 1_000_000) {
-        reject(new Error('Request too large'));
-        req.destroy();
-      }
+      if (body.length > 1_000_000) { reject(new Error('Request too large')); req.destroy(); }
     });
     req.on('end', () => {
       if (!body) return resolve({});
@@ -93,6 +87,7 @@ function readJsonBody(req) {
 function normalizeEmail(v='') { return String(v).trim().toLowerCase(); }
 function publicUser(u) { return { id:u.id, displayName:u.displayName, email:u.email, createdAt:u.createdAt }; }
 function passwordHash(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
+function tokenHash(token) { return crypto.createHash('sha256').update(token).digest('hex'); }
 function safeEqualHex(a, b) {
   try {
     const aa = Buffer.from(a, 'hex'), bb = Buffer.from(b, 'hex');
@@ -111,16 +106,70 @@ function sessionCookie(token, maxAge=60*60*24*7) {
   const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
   return `one_touch_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`;
 }
-function currentUser(req) {
-  const token = parseCookies(req).one_touch_session;
-  const userId = token && sessions.get(token);
-  if (!userId) return null;
-  return readUsers().find(u => u.id === userId) || null;
+function dbUser(row) {
+  return row ? {
+    id: row.id,
+    displayName: row.display_name,
+    email: row.email,
+    salt: row.password_salt,
+    passwordHash: row.password_hash,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at
+  } : null;
 }
-function newSession(userId) {
+async function findUserByEmail(email) {
+  if (!pool) return readUsers().find(u => u.email === email) || null;
+  const r = await pool.query('SELECT * FROM users WHERE email = $1 LIMIT 1', [email]);
+  return dbUser(r.rows[0]);
+}
+async function findUserById(id) {
+  if (!pool) return readUsers().find(u => u.id === id) || null;
+  const r = await pool.query('SELECT * FROM users WHERE id = $1 LIMIT 1', [id]);
+  return dbUser(r.rows[0]);
+}
+async function createUserRecord(user) {
+  if (!pool) {
+    const users = readUsers();
+    if (users.some(u => u.email === user.email)) throw Object.assign(new Error('An account with that email already exists.'), { code:'DUPLICATE_EMAIL' });
+    users.push(user); writeUsers(users); return user;
+  }
+  try {
+    const r = await pool.query(
+      'INSERT INTO users (id, display_name, email, password_salt, password_hash, created_at) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [user.id, user.displayName, user.email, user.salt, user.passwordHash, user.createdAt]
+    );
+    return dbUser(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') throw Object.assign(new Error('An account with that email already exists.'), { code:'DUPLICATE_EMAIL' });
+    throw e;
+  }
+}
+async function newSession(userId) {
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, userId);
+  if (!pool) localSessions.set(token, userId);
+  else {
+    const expires = new Date(Date.now() + 7*24*60*60*1000);
+    await pool.query('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1,$2,$3)', [tokenHash(token), userId, expires]);
+  }
   return token;
+}
+async function currentUser(req) {
+  const token = parseCookies(req).one_touch_session;
+  if (!token) return null;
+  if (!pool) {
+    const userId = localSessions.get(token);
+    return userId ? findUserById(userId) : null;
+  }
+  const r = await pool.query(
+    `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.token_hash = $1 AND s.expires_at > NOW() LIMIT 1`,
+    [tokenHash(token)]
+  );
+  return dbUser(r.rows[0]);
+}
+async function removeSession(token) {
+  if (!token) return;
+  if (!pool) localSessions.delete(token);
+  else await pool.query('DELETE FROM sessions WHERE token_hash = $1', [tokenHash(token)]);
 }
 
 async function authSignup(req, res) {
@@ -132,50 +181,48 @@ async function authSignup(req, res) {
     if (displayName.length < 2) return json(res, 400, {error:'Display name must be at least 2 characters.'});
     if (!/^\S+@\S+\.\S+$/.test(email)) return json(res, 400, {error:'Enter a valid email address.'});
     if (password.length < 8) return json(res, 400, {error:'Password must be at least 8 characters.'});
-    const users = readUsers();
-    if (users.some(u => u.email === email)) return json(res, 409, {error:'An account with that email already exists.'});
+    if (await findUserByEmail(email)) return json(res, 409, {error:'An account with that email already exists.'});
     const salt = crypto.randomBytes(16).toString('hex');
-    const user = {
+    const user = await createUserRecord({
       id: crypto.randomUUID(), displayName, email, salt,
-      passwordHash: passwordHash(password, salt),
-      createdAt: new Date().toISOString()
-    };
-    users.push(user); writeUsers(users);
-    const token = newSession(user.id);
-    json(res, 201, {user:publicUser(user)}, {'Set-Cookie':sessionCookie(token)});
-  } catch (e) { json(res, 400, {error:e.message || 'Could not create account.'}); }
+      passwordHash: passwordHash(password, salt), createdAt: new Date().toISOString()
+    });
+    const token = await newSession(user.id);
+    json(res, 201, {user:publicUser(user), storage: pool ? 'postgres' : 'local'}, {'Set-Cookie':sessionCookie(token)});
+  } catch (e) {
+    if (e.code === 'DUPLICATE_EMAIL') return json(res, 409, {error:e.message});
+    json(res, 500, {error:'Could not create account.'});
+  }
 }
-
 async function authLogin(req, res) {
   try {
     const body = await readJsonBody(req);
     const email = normalizeEmail(body.email);
     const password = String(body.password || '');
-    const user = readUsers().find(u => u.email === email);
+    const user = await findUserByEmail(email);
     if (!user || !safeEqualHex(passwordHash(password, user.salt), user.passwordHash)) return json(res, 401, {error:'Incorrect email or password.'});
-    const token = newSession(user.id);
-    json(res, 200, {user:publicUser(user)}, {'Set-Cookie':sessionCookie(token)});
-  } catch (e) { json(res, 400, {error:e.message || 'Could not log in.'}); }
+    const token = await newSession(user.id);
+    json(res, 200, {user:publicUser(user), storage: pool ? 'postgres' : 'local'}, {'Set-Cookie':sessionCookie(token)});
+  } catch { json(res, 500, {error:'Could not log in.'}); }
 }
-
-function authMe(req, res) {
-  const user = currentUser(req);
-  json(res, 200, {user:user ? publicUser(user) : null});
+async function authMe(req, res) {
+  try {
+    const user = await currentUser(req);
+    json(res, 200, {user:user ? publicUser(user) : null, storage:pool ? 'postgres' : 'local'});
+  } catch { json(res, 500, {error:'Could not read account.'}); }
 }
-function authLogout(req, res) {
-  const token = parseCookies(req).one_touch_session;
-  if (token) sessions.delete(token);
-  json(res, 200, {ok:true}, {'Set-Cookie':sessionCookie('', 0)});
+async function authLogout(req, res) {
+  try { await removeSession(parseCookies(req).one_touch_session); }
+  finally { json(res, 200, {ok:true}, {'Set-Cookie':sessionCookie('', 0)}); }
 }
 
 async function getJson(url) {
   const sep = url.includes('?') ? '&' : '?';
   const freshUrl = `${url}${sep}_=${Date.now()}`;
-  const r = await fetch(freshUrl, { headers: { 'User-Agent': 'OneTouchFantasy/1.2', 'Accept': 'application/json', 'Cache-Control': 'no-cache' } });
+  const r = await fetch(freshUrl, { headers: { 'User-Agent': 'OneTouchFantasy/1.3', 'Accept': 'application/json', 'Cache-Control': 'no-cache' } });
   if (!r.ok) throw new Error(`Feed returned ${r.status}`);
   return r.json();
 }
-
 async function scores(req, res, url) {
   const sport = url.searchParams.get('sport') || 'Soccer';
   if (!feeds[sport]) return json(res, 400, { error: 'Unknown sport' });
@@ -184,11 +231,9 @@ async function scores(req, res, url) {
     const good = results.filter(r => r.status === 'fulfilled').map(r => r.value);
     const failedFeeds = results.length - good.length;
     if (!good.length) throw results.find(r => r.status === 'rejected')?.reason || new Error('All score sources failed');
-    const events = good.flatMap(d => d.events || []);
-    json(res, 200, { sport, updatedAt: new Date().toISOString(), failedFeeds, events });
+    json(res, 200, { sport, updatedAt: new Date().toISOString(), failedFeeds, events:good.flatMap(d => d.events || []) });
   } catch (e) { json(res, 502, { error: 'Could not load live scores', detail: e.message }); }
 }
-
 function extractTeams(data) {
   const leagues = data?.sports?.flatMap(s => s.leagues || []) || [];
   return leagues.flatMap(l => l.teams || []).map(x => x.team || x).filter(Boolean);
@@ -203,7 +248,8 @@ function flattenRoster(data, teamName, leagueLabel) {
   if (Array.isArray(data?.items)) raw.push(...data.items);
   return raw.map(a => ({
     id: String(a.id || a.uid || `${teamName}-${a.displayName || a.fullName || Math.random()}`),
-    name: a.displayName || a.fullName || a.shortName || a.name || 'Unknown player', team: teamName, league: leagueLabel,
+    name: a.displayName || a.fullName || a.shortName || a.name || 'Unknown player',
+    team: teamName, league: leagueLabel,
     position: a.position?.abbreviation || a.position?.displayName || a.position?.name || a._group || 'Player',
     headshot: a.headshot?.href || a.headshot || ''
   })).filter(p => p.name !== 'Unknown player');
@@ -230,7 +276,8 @@ async function loadAthleteLeague(source) {
   for (let i=0; i<refs.length; i+=40) {
     const got = await Promise.allSettled(refs.slice(i,i+40).map(x => getJson(x.$ref)));
     for (const r of got) if (r.status === 'fulfilled') {
-      const a = r.value; out.push({id:String(a.id||refId(a.$ref)||''),name:a.displayName||a.fullName||a.name||'Unknown player',team:source.label,league:source.label,position:a.position?.abbreviation||'Player',headshot:a.headshot?.href||''});
+      const a = r.value;
+      out.push({id:String(a.id||refId(a.$ref)||''),name:a.displayName||a.fullName||a.name||'Unknown player',team:source.label,league:source.label,position:a.position?.abbreviation||'Player',headshot:a.headshot?.href||''});
     }
   }
   return out.filter(p => p.name !== 'Unknown player');
@@ -272,6 +319,7 @@ function staticFile(req, res, url) {
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  if (url.pathname === '/api/health') return json(res, 200, {ok:true, database:pool ? 'postgres' : 'local'});
   if (url.pathname === '/api/auth/signup' && req.method === 'POST') return authSignup(req,res);
   if (url.pathname === '/api/auth/login' && req.method === 'POST') return authLogin(req,res);
   if (url.pathname === '/api/auth/logout' && req.method === 'POST') return authLogout(req,res);
@@ -279,4 +327,4 @@ http.createServer(async (req, res) => {
   if (url.pathname === '/api/scores') return scores(req, res, url);
   if (url.pathname === '/api/players') return players(req, res, url);
   return staticFile(req, res, url);
-}).listen(PORT, () => console.log(`One Touch is running at http://localhost:${PORT}`));
+}).listen(PORT, () => console.log(`One Touch is running at http://localhost:${PORT} (${pool ? 'PostgreSQL' : 'local storage'})`));
