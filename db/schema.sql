@@ -51,5 +51,13 @@ CREATE TABLE IF NOT EXISTS league_members (
   league_id UUID NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  total_points NUMERIC(12,2) NOT NULL DEFAULT 0,
+  wins INTEGER NOT NULL DEFAULT 0,
+  matches_played INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (league_id, user_id)
 );
+
+ALTER TABLE league_members ADD COLUMN IF NOT EXISTS total_points NUMERIC(12,2) NOT NULL DEFAULT 0;
+ALTER TABLE league_members ADD COLUMN IF NOT EXISTS wins INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE league_members ADD COLUMN IF NOT EXISTS matches_played INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS league_members_leaderboard_idx ON league_members(league_id, total_points DESC, wins DESC);
