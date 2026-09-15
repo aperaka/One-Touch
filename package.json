@@ -1,9 +1,16 @@
 {
   "name": "one-touch-live",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "One Touch fantasy sports prototype with live scores and multi-sport player pools.",
+  "description": "One Touch fantasy sports web app with live scores, multi-sport player pools, and account support.",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "db:init": "node scripts/init-db.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
   }
 }

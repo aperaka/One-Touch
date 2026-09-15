@@ -1,13 +1,37 @@
-# One Touch Live
+# One Touch
 
-A local prototype for One Touch with live score feeds and dynamic fantasy player pools.
+One Touch is a multi-sport fantasy sports prototype with live scores, dynamic player pools, and user accounts.
 
 ## Run locally
 
 1. Install Node.js 18+.
 2. Open a terminal in this folder.
-3. Run `npm start` (or `npm.cmd start` in Windows PowerShell if script execution is restricted).
-4. Open `http://localhost:3000`.
+3. Run `npm install`.
+4. Run `npm start` (or `npm.cmd start` in Windows PowerShell if script execution is restricted).
+5. Open `http://localhost:3000`.
+
+Without `DATABASE_URL`, One Touch uses local JSON user storage so development stays simple.
+
+## PostgreSQL setup
+
+For persistent production accounts:
+
+1. Create a PostgreSQL database with your hosting/database provider.
+2. Set `DATABASE_URL` using the format shown in `.env.example`.
+3. Run `npm run db:init` to create the One Touch tables.
+4. Start the app with `npm start`.
+
+When `DATABASE_URL` is present, signup/login accounts and sessions use PostgreSQL. Session tokens are stored as SHA-256 hashes in the database and browser cookies are HttpOnly, SameSite=Lax, and Secure when `NODE_ENV=production`.
+
+The included schema also creates tables for fantasy teams, selected fantasy players, leagues, and league membership so those features can be persisted next.
+
+## Account API
+
+- `POST /api/auth/signup`
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
+- `GET /api/auth/me`
+- `GET /api/health`
 
 ## Included sports
 
